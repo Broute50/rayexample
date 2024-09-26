@@ -2,8 +2,9 @@ import ray
 from ray.train.lightgbm import LightGBMTrainer
 from ray.air.config import ScalingConfig
 import ray.data
-from sklearn.metrics import accuracy_score
+import numpy as np
 import pickle
+from sklearn.metrics import accuracy_score
 
 # Ray'i başlat ve cluster'a bağlan
 ray.init(address='auto', ignore_reinit_error=True)
@@ -12,16 +13,13 @@ ray.init(address='auto', ignore_reinit_error=True)
 train_data = ray.data.read_csv('train_data.csv')
 test_data = ray.data.read_csv('test_data.csv')
 
-# Veriyi işlemeye başla
+# Ray Dataset'ini LightGBM uyumlu numpy array'e dönüştürme
 def preprocess_data(ray_dataset):
-    # Özellikler ve hedefi ayırıyoruz
-    features = ray_dataset.drop_columns(["target"])
-    target = ray_dataset.select_columns(["target"])
-    
-    # Özellikler ve hedef verilerini numpy dizilerine dönüştür
-    features_np = features.to_numpy()
-    target_np = target.to_numpy().flatten()  # Tek boyutlu hale getir
-    return features_np, target_np
+    # Batch'ler halinde verileri alıyoruz
+    batches = list(ray_dataset.iter_batches(batch_size=None, batch_format="numpy"))
+    features = np.concatenate([batch[:, :-1] for batch in batches], axis=0)
+    target = np.concatenate([batch[:, -1] for batch in batches], axis=0)
+    return features, target
 
 # Eğitim ve test verilerini hazırlama
 X_train, y_train = preprocess_data(train_data)
@@ -29,13 +27,13 @@ X_test, y_test = preprocess_data(test_data)
 
 # Ray-LightGBM kullanarak model eğitimi yapıyoruz
 def train_ray_lightgbm(X_train, y_train):
-    # Eğitim verisini birleştiriyoruz
+    # Eğitim verilerini LightGBMTrainer için uygun formata çevirme
     train_dataset = ray.data.from_numpy(np.column_stack((X_train, y_train)))
 
     # Ray-LightGBM Trainer kullanarak modeli dağıtık bir şekilde eğitiyoruz
     trainer = LightGBMTrainer(
         scaling_config=ScalingConfig(num_workers=2),  # 2 worker kullanıyoruz
-        label_column="target",
+        label_column=train_dataset.schema().names[-1],  # Son sütunu hedef olarak alıyoruz
         params={
             "objective": "binary",
             "metric": "binary_logloss",
@@ -60,7 +58,11 @@ def train_ray_lightgbm(X_train, y_train):
 
 # Ray remote decorator kullanarak işlemi dağıtık hale getirme
 @ray.remote
-def predict_and_score(model, X_test, y_test):
+def predict_and_score(X_test, y_test):
+    # Kaydedilen modeli yükle
+    with open('lightgbm_model.pkl', 'rb') as f:
+        model = pickle.load(f)
+        
     # Tahmin yapma
     y_pred = model.predict(X_test)
     y_pred_binary = [1 if pred > 0.5 else 0 for pred in y_pred]
@@ -80,7 +82,7 @@ if __name__ == '__main__':
     model = train_ray_lightgbm(X_train, y_train)
 
     # Modeli Ray remote task ile test et
-    ray.get(predict_and_score.remote(model, X_test, y_test))
+    ray.get(predict_and_score.remote(X_test, y_test))
 
     # Ray'i kapat
     ray.shutdown()
